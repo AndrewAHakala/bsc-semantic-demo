@@ -1,0 +1,15 @@
+{"id": "gp-001", "mode": "free_text", "free_text": "Order 01234 is late. Latest status?", "expected_order_id_suffix": "001234", "tags": ["partial_id", "status_check"]}
+{"id": "gp-002", "mode": "free_text", "free_text": "St Mary's order from last Tuesday — can you find it?", "expected_facility_token": "mary", "tags": ["fuzzy_facility", "date_relative"]}
+{"id": "gp-003", "mode": "free_text", "free_text": "Need tracking for Cleveland Clinic order placed early March.", "expected_facility_token": "cleveland", "tags": ["fuzzy_facility", "tracking", "date_window"]}
+{"id": "gp-004", "mode": "free_text", "free_text": "Where is my order to Saint Mary Hospital Boston?", "expected_facility_token": "mary", "tags": ["fuzzy_facility", "saint_variant"]}
+{"id": "gp-005", "mode": "free_text", "free_text": "Late shipment to Mercy Chicago, still showing allocated.", "expected_facility_token": "mercy", "expected_status": "ALLOCATED", "tags": ["fuzzy_facility", "backordered"]}
+{"id": "gp-006", "mode": "structured", "fields": {"facility_name": "Cleveland Clinic", "date_start": "2026-03-01", "date_end": "2026-03-15"}, "expected_facility_token": "cleveland", "tags": ["structured", "date_window"]}
+{"id": "gp-007", "mode": "free_text", "free_text": "Any BACKORDERED orders to University of Michigan med center this week?", "expected_facility_token": "michigan", "expected_status": "BACKORDERED", "tags": ["status_filter", "fuzzy_facility"]}
+{"id": "gp-008", "mode": "free_text", "free_text": "Customer called about PO 884192 — what's the status?", "expected_po_suffix": "884192", "tags": ["po_lookup"]}
+{"id": "gp-009", "mode": "free_text", "free_text": "Priority order to Mass General placed yesterday — is it shipped?", "expected_facility_token": "general", "tags": ["priority", "fuzzy_facility", "date_relative"]}
+{"id": "gp-010", "mode": "structured", "fields": {"customer_name": "Ascension Health", "date_start": "2026-01-01", "date_end": "2026-03-31"}, "expected_customer_token": "ascension", "tags": ["structured", "customer_name"]}
+{"id": "gp-011", "mode": "free_text", "free_text": "Hosp in Houston — we have a CRM device order that's on hold.", "expected_facility_token": "houston", "expected_status": "ON_HOLD", "tags": ["fuzzy_city", "status_filter"]}
+{"id": "gp-012", "mode": "free_text", "free_text": "Rep from Banner Health Tucson called about a late delivery.", "expected_facility_token": "banner", "tags": ["fuzzy_system", "delivery"]}
+{"id": "gp-013", "mode": "free_text", "free_text": "Order SO-2025-012345 — any update?", "expected_order_id": "SO-2025-012345", "tags": ["exact_id"]}
+{"id": "gp-014", "mode": "free_text", "free_text": "Looking for a shipped order to Advocate Lutheran General from last month.", "expected_facility_token": "lutheran", "expected_status": "SHIPPED", "tags": ["fuzzy_facility", "date_relative"]}
+{"id": "gp-015", "mode": "free_text", "free_text": "Do we have tracking for the Dignity Health order placed March 5?", "expected_facility_token": "dignity", "tags": ["tracking", "date_exact"]}
