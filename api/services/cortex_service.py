@@ -29,6 +29,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class ParsedIntent:
+    intent: str = "order_lookup"  # "order_lookup" or "metric_query"
     order_id: Optional[str] = None
     purchase_order_id: Optional[str] = None
     customer_name: Optional[str] = None
@@ -36,6 +37,8 @@ class ParsedIntent:
     date_start: Optional[str] = None
     date_end: Optional[str] = None
     contact_name: Optional[str] = None
+    metric_question: Optional[str] = None
+    metric_params: Optional[Dict[str, Any]] = None
     raw_response: str = ""
 
 
@@ -49,10 +52,19 @@ class RerankResult:
 
 _PARSE_PROMPT_TEMPLATE = """\
 You are an order lookup assistant for a medical device company.
-Extract structured fields from the user's query. Return ONLY a valid JSON object.
+Classify the user's query and extract structured fields. Return ONLY a valid JSON object.
 Do not explain. Do not add markdown. Return null for unknown fields.
 
+First, determine the intent:
+  - "order_lookup": the user is looking for a SPECIFIC order, shipment, tracking info,
+    or asking about a particular customer/facility's order. Keywords: order, tracking,
+    shipment, status, delivery, PO, purchase order.
+  - "metric_query": the user is asking an AGGREGATE or ANALYTICAL question about
+    orders — counts, averages, trends, comparisons, totals, breakdowns by status/region/time.
+    Keywords: how many, total, average, count, trend, breakdown, by status, by region.
+
 Fields to extract:
+  intent: "order_lookup" or "metric_query"
   order_id: string or null (e.g. "SO-2026-001234" or partial like "01234")
   purchase_order_id: string or null
   customer_name: string or null
@@ -60,6 +72,7 @@ Fields to extract:
   date_start: ISO date string or null (start of date window)
   date_end: ISO date string or null (end of date window)
   contact_name: string or null
+  metric_question: string or null (for metric_query intent, rephrase the question clearly)
 
 Today's date: {today}
 
@@ -93,6 +106,54 @@ Return ONLY a valid JSON object in this exact format:
 }}"""
 
 
+_COMBINED_PARSE_TEMPLATE = """\
+Classify and return JSON only.
+Intent: "order_lookup"=specific order. "metric_query"=aggregate/count/trend.
+Metrics: {metric_names}
+Dims: {dim_names}
+Rules: order_count=all orders, fulfilled_order_count=shipped/delivered only.
+group_by: type="dimension" grain=null, or type="time_dimension" grain="MONTH"/"YEAR".
+Today:{today} Query:{query}
+JSON:{{"intent":"...","order_id":null,"customer_name":null,"facility_name":null,"date_start":null,"date_end":null,"contact_name":null,"purchase_order_id":null,"metric_question":null,"metric_params":{{"metrics":[],"group_by":[],"order_by":null,"where":null,"limit":null}}}}"""
+
+
+_METRIC_QUERY_BUILDER_TEMPLATE = """\
+You are a data analyst assistant. Given a user question and the available metrics
+and dimensions from a semantic layer, produce the EXACT parameters needed to
+query the metrics API.
+
+Available metrics:
+{metrics_json}
+
+Available dimensions:
+{dimensions_json}
+
+Rules:
+1. Pick the most relevant metric(s) from the list above.
+2. Pick group_by dimensions that answer the question. Each group_by item needs:
+   - "name": dimension name from the list
+   - "type": "dimension" for CATEGORICAL, "time_dimension" for TIME
+   - "grain": null for CATEGORICAL, or "DAY"/"WEEK"/"MONTH"/"QUARTER"/"YEAR" for TIME
+3. Add order_by if the question implies sorting (most, top, recent, etc.).
+   Each item needs "name" and "descending" (boolean).
+4. Add limit if the question asks for top N.
+5. Add where clause only if the question specifies a filter.
+   Use Dimension/TimeDimension syntax: {{{{ Dimension('name') }}}} or {{{{ TimeDimension('name', 'GRAIN') }}}}.
+
+Return ONLY a valid JSON object:
+{{
+  "metrics": ["metric_name"],
+  "group_by": [{{"name": "dim", "type": "dimension", "grain": null}}],
+  "order_by": [{{"name": "metric_name", "descending": true}}],
+  "where": null,
+  "limit": null
+}}
+
+User question: {question}
+
+Return JSON only."""
+
+
 def _cache_key(*parts: Any) -> str:
     raw = json.dumps(parts, default=str, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -110,11 +171,31 @@ class CortexService:
     # Public API
     # ------------------------------------------------------------------
 
-    def parse_user_input(self, text: str) -> ParsedIntent:
-        """Call Cortex to extract structured fields from free-form text."""
+    def parse_user_input(
+        self,
+        text: str,
+        available_metrics: Optional[List[Dict[str, Any]]] = None,
+        available_dimensions: Optional[List[Dict[str, Any]]] = None,
+    ) -> ParsedIntent:
+        """Call Cortex to classify intent and extract fields.
+
+        When metrics/dimensions are provided, the LLM also builds query_metrics
+        params for metric_query intents in the same call (saving a round trip).
+        """
         from datetime import date
         today = date.today().isoformat()
-        prompt = _PARSE_PROMPT_TEMPLATE.format(today=today, query=text)
+
+        if available_metrics and available_dimensions:
+            metric_names = ", ".join(m.get("name", "") for m in available_metrics)
+            dim_names = ", ".join(d.get("name", "") for d in available_dimensions)
+            prompt = _COMBINED_PARSE_TEMPLATE.format(
+                today=today,
+                query=text,
+                metric_names=metric_names,
+                dim_names=dim_names,
+            )
+        else:
+            prompt = _PARSE_PROMPT_TEMPLATE.format(today=today, query=text)
 
         raw = self._complete(prompt, label="parse_user_input")
         intent = self._safe_parse_intent(raw)
@@ -170,6 +251,61 @@ class CortexService:
         self._rerank_cache[cache_key] = result
         return result
 
+    def build_metric_query_params(
+        self,
+        question: str,
+        available_metrics: List[Dict[str, Any]],
+        available_dimensions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Use Cortex to map a natural-language question to query_metrics params."""
+        metrics_desc = json.dumps(
+            [{"name": m.get("name"), "description": m.get("description", "")} for m in available_metrics],
+            indent=2,
+        )
+        dims_desc = json.dumps(
+            [{"name": d.get("name"), "type": d.get("type", "CATEGORICAL")} for d in available_dimensions],
+            indent=2,
+        )
+        prompt = _METRIC_QUERY_BUILDER_TEMPLATE.format(
+            question=question,
+            metrics_json=metrics_desc,
+            dimensions_json=dims_desc,
+        )
+        raw = self._complete(prompt, label="metric_query_builder")
+        try:
+            return json.loads(self._extract_json_block(raw))
+        except json.JSONDecodeError:
+            # LLM sometimes truncates closing braces — try to repair
+            repaired = self._repair_json(raw)
+            if repaired:
+                return repaired
+            logger.warning(f"metric_query_builder_failed: cannot parse | raw={raw[:300]}")
+            return {}
+
+    @staticmethod
+    def _repair_json(raw: str) -> Optional[Dict[str, Any]]:
+        """Attempt to repair truncated JSON from LLM output."""
+        text = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        text = text.replace("```", "").strip()
+        start = text.find("{")
+        if start < 0:
+            return None
+        fragment = text[start:]
+        suffixes = [
+            "}",
+            "]}",
+            "null}",
+            "null]}",
+            "\"}",
+            "\"]}"
+        ]
+        for suffix in suffixes:
+            try:
+                return json.loads(fragment + suffix)
+            except json.JSONDecodeError:
+                continue
+        return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -216,8 +352,17 @@ class CortexService:
 
     def _safe_parse_intent(self, raw: str) -> ParsedIntent:
         try:
-            data = json.loads(self._extract_json_block(raw))
+            block = self._extract_json_block(raw)
+            try:
+                data = json.loads(block)
+            except json.JSONDecodeError:
+                repaired = self._repair_json(raw)
+                if repaired:
+                    data = repaired
+                else:
+                    raise
             return ParsedIntent(
+                intent=data.get("intent", "order_lookup"),
                 order_id=data.get("order_id"),
                 purchase_order_id=data.get("purchase_order_id"),
                 customer_name=data.get("customer_name"),
@@ -225,6 +370,8 @@ class CortexService:
                 date_start=data.get("date_start"),
                 date_end=data.get("date_end"),
                 contact_name=data.get("contact_name"),
+                metric_question=data.get("metric_question"),
+                metric_params=data.get("metric_params"),
             )
         except Exception as exc:
             logger.warning(f"parse_intent_failed: {exc} | raw={raw[:200]}")

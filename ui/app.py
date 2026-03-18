@@ -14,6 +14,7 @@ load_dotenv()
 
 from components.search_form import render_search_form
 from components.results_table import render_results
+from components.metric_panel import render_metric_results
 from components.sql_panel import render_explain_panel
 from components.trace_panel import render_trace_panel
 
@@ -38,7 +39,7 @@ if "trace_history" not in st.session_state:
 st.title("📦 Order Status Assistant")
 st.markdown(
     "_Boston Scientific · Medical Device Fulfillment · "
-    "Powered by Snowflake + Cortex_"
+    "Powered by Snowflake + Cortex + dbt Semantic Layer_"
 )
 
 # Health check badges
@@ -46,21 +47,27 @@ try:
     hc = httpx.get(f"{API_BASE}/health", timeout=10.0)
     hc_data = hc.json()
 
-    col_sf, col_dbt = st.columns(2)
+    col_sf, col_dbt, col_backend = st.columns(3)
     with col_sf:
         if hc_data.get("snowflake", False):
-            st.success("✅ Connected to Snowflake")
+            st.success("Connected to Snowflake")
         else:
-            st.warning("⚠️ Snowflake degraded")
+            st.warning("Snowflake degraded")
     with col_dbt:
         if hc_data.get("dbt_cloud", False):
-            st.success("✅ Connected to dbt Cloud")
+            st.success("Connected to dbt Cloud (MCP)")
         elif hc_data.get("dbt_cloud_configured", False):
-            st.warning("⚠️ dbt Cloud configured but unreachable")
+            st.warning("dbt Cloud configured but unreachable")
         else:
-            st.info("ℹ️ dbt Cloud not configured")
+            st.info("dbt Cloud not configured")
+    with col_backend:
+        backend = hc_data.get("semantic_backend", "direct_sql")
+        if backend == "dbt_mcp":
+            st.info("Semantic Layer: Active")
+        else:
+            st.info("Semantic Layer: Direct SQL")
 except Exception:
-    st.error("❌ API unreachable — is the FastAPI server running?")
+    st.error("API unreachable — is the FastAPI server running?")
 
 st.markdown("---")
 
@@ -72,7 +79,7 @@ with left_col:
 
 with right_col:
     if run:
-        with st.spinner("Searching orders…"):
+        with st.spinner("Searching…"):
             try:
                 resp = httpx.post(
                     f"{API_BASE}/search/orders",
@@ -98,7 +105,10 @@ with right_col:
                 st.session_state.trace_history.append(
                     {
                         "trace_id": trace_id[:8] + "…",
+                        "type": data.get("response_type", "order_lookup"),
                         "total_ms": timings.get("total_ms", 0),
+                        "cortex_parse_ms": timings.get("cortex_parse_ms", 0),
+                        "mcp_query_ms": timings.get("mcp_query_ms", 0),
                         "sql_candidate_ms": timings.get("sql_candidate_ms", 0),
                         "cortex_rerank_ms": timings.get("cortex_rerank_ms", 0),
                         "sql_fetch_top_ms": timings.get("sql_fetch_top_ms", 0),
@@ -112,28 +122,53 @@ with right_col:
 
     if st.session_state.last_response:
         data = st.session_state.last_response
-        results_tab, explain_tab, perf_tab = st.tabs(
-            ["🔍 Results", "🧠 Explain", "⏱️ Performance"]
-        )
+        response_type = data.get("response_type", "order_lookup")
 
-        with results_tab:
-            render_results(data.get("results", []), data.get("trace_id", ""))
-
-        with explain_tab:
-            # Merge SQL from search response into explain payload for display
-            explain_data = st.session_state.last_explain or {}
-            if not explain_data.get("candidate_sql") and data.get("candidate_sql"):
-                explain_data["candidate_sql"] = data["candidate_sql"]
-            if not explain_data.get("fetch_sql") and data.get("fetch_sql"):
-                explain_data["fetch_sql"] = data["fetch_sql"]
-            explain_data["candidate_count"] = data.get("candidate_count", "—")
-            render_explain_panel(explain_data)
-
-        with perf_tab:
-            render_trace_panel(
-                timings=data.get("timings_ms", {}),
-                trace_id=data.get("trace_id", ""),
-                history=st.session_state.trace_history,
+        if response_type == "metric_query":
+            metric_tab, explain_tab, perf_tab = st.tabs(
+                ["📊 Metric Results", "🧠 Explain", "⏱️ Performance"]
             )
+
+            with metric_tab:
+                render_metric_results(
+                    data.get("metric_result"), data.get("trace_id", "")
+                )
+
+            with explain_tab:
+                explain_data = st.session_state.last_explain or {}
+                if not explain_data.get("candidate_sql") and data.get("candidate_sql"):
+                    explain_data["candidate_sql"] = data["candidate_sql"]
+                explain_data["candidate_count"] = data.get("candidate_count", "—")
+                render_explain_panel(explain_data)
+
+            with perf_tab:
+                render_trace_panel(
+                    timings=data.get("timings_ms", {}),
+                    trace_id=data.get("trace_id", ""),
+                    history=st.session_state.trace_history,
+                )
+        else:
+            results_tab, explain_tab, perf_tab = st.tabs(
+                ["🔍 Results", "🧠 Explain", "⏱️ Performance"]
+            )
+
+            with results_tab:
+                render_results(data.get("results", []), data.get("trace_id", ""))
+
+            with explain_tab:
+                explain_data = st.session_state.last_explain or {}
+                if not explain_data.get("candidate_sql") and data.get("candidate_sql"):
+                    explain_data["candidate_sql"] = data["candidate_sql"]
+                if not explain_data.get("fetch_sql") and data.get("fetch_sql"):
+                    explain_data["fetch_sql"] = data["fetch_sql"]
+                explain_data["candidate_count"] = data.get("candidate_count", "—")
+                render_explain_panel(explain_data)
+
+            with perf_tab:
+                render_trace_panel(
+                    timings=data.get("timings_ms", {}),
+                    trace_id=data.get("trace_id", ""),
+                    history=st.session_state.trace_history,
+                )
     else:
         st.info("Enter search criteria and click **Search Orders** to begin.")

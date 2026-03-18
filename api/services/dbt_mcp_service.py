@@ -1,36 +1,41 @@
-"""dbt Cloud Semantic Layer integration via remote MCP / REST API.
+"""dbt Cloud Semantic Layer integration via MCP Streamable HTTP transport.
 
-When semantic_backend = 'dbt_mcp', the SemanticService uses this adapter to:
-  1. Enumerate available semantic objects (metrics, dimensions, entities)
-  2. Compile/generate SQL from semantic definitions via dbt Cloud
-  3. Log the semantic objects used for explainability
+Maintains a persistent MCP session on a background asyncio loop so that
+sync FastAPI handlers can call Semantic Layer tools without per-request
+connection overhead.  Typical tool latency: 500-1700 ms.
 
-The adapter calls the dbt Cloud remote MCP endpoint, which exposes tools
-like list_metrics, list_dimensions, list_entities, query_metrics, and
-get_metrics_compiled_sql.
+Exposed tools (all sync wrappers):
+  - list_metrics()
+  - get_dimensions(metrics)
+  - get_entities(metrics)
+  - query_metrics(...)   → returns rows directly from dbt Cloud
+  - get_compiled_sql(...)→ returns compiled SQL string
+  - text_to_sql(text)    → natural-language → SQL
 
-Falls back gracefully to direct SQL when dbt Cloud is unreachable.
+Falls back gracefully when dbt Cloud is unreachable.
 """
 
+import asyncio
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-
-import httpx
 
 from api.core.config import settings
 from api.core.log import get_logger
 
 logger = get_logger(__name__)
 
-_MCP_TIMEOUT = 15.0
+_SESSION_LOCK = threading.Lock()
+_MCP_CALL_TIMEOUT = 15.0  # seconds per tool call
+_CACHE_TTL = 300  # 5 min cache for metadata
 
 
 @dataclass
 class SemanticObject:
     name: str
-    object_type: str  # metric, dimension, entity, semantic_model
+    object_type: str
     description: str = ""
     expr: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
@@ -44,224 +49,310 @@ class SemanticQueryResult:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
-class DbtMcpService:
-    """Adapter for dbt Cloud Semantic Layer via the remote MCP endpoint.
+class _McpLoop:
+    """Manages a background asyncio loop + persistent MCP session."""
 
-    Calls dbt Cloud's remote MCP HTTP API to enumerate and query
-    semantic objects. When dbt Cloud is unreachable, all methods return
-    empty results and log warnings — the application continues via
-    direct SQL fallback.
+    def __init__(self, url: str, headers: Dict[str, str]):
+        self._url = url
+        self._headers = headers
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._session = None  # mcp.ClientSession
+        self._read = None
+        self._write = None
+        self._ctx_stack = None
+        self._connected = False
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        """Start the background loop and connect.  Returns True on success."""
+        if self._connected:
+            return True
+        with self._lock:
+            if self._connected:
+                return True
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._loop.run_forever, daemon=True, name="mcp-loop"
+            )
+            self._thread.start()
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+                fut.result(timeout=20)
+                return self._connected
+            except Exception as exc:
+                logger.warning(f"mcp_connect_failed: {exc}")
+                return False
+
+    async def _connect(self):
+        from mcp.client.streamable_http import streamablehttp_client
+        from mcp import ClientSession
+
+        try:
+            cm = streamablehttp_client(self._url, headers=self._headers)
+            self._read, self._write, _ = await cm.__aenter__()
+            self._ctx_stack = cm
+
+            session = ClientSession(self._read, self._write)
+            self._session = await session.__aenter__()
+            await self._session.initialize()
+            self._connected = True
+            logger.info("mcp_session_connected", extra={"extra": {"url": self._url}})
+        except Exception as exc:
+            self._connected = False
+            logger.error(f"mcp_session_error: {exc}")
+            raise
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """Sync wrapper: call an MCP tool and return parsed result."""
+        if not self._connected:
+            raise RuntimeError("MCP session not connected")
+        fut = asyncio.run_coroutine_threadsafe(
+            self._session.call_tool(name, arguments), self._loop
+        )
+        result = fut.result(timeout=_MCP_CALL_TIMEOUT)
+
+        if getattr(result, "isError", False):
+            error_text = ""
+            for block in (result.content or []):
+                if hasattr(block, "text"):
+                    error_text += block.text
+            logger.error(f"mcp_tool_returned_error: {name}: {error_text[:500]}")
+            raise RuntimeError(f"MCP tool error ({name}): {error_text[:300]}")
+
+        return self._parse_content(result)
+
+    @staticmethod
+    def _parse_content(result) -> Any:
+        """Extract text content from MCP tool result."""
+        if not result or not result.content:
+            return None
+        texts = []
+        for block in result.content:
+            if hasattr(block, "text"):
+                try:
+                    texts.append(json.loads(block.text))
+                except (json.JSONDecodeError, TypeError):
+                    texts.append(block.text)
+        if len(texts) == 1:
+            return texts[0]
+        return texts
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def stop(self):
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+
+class DbtMcpService:
+    """Sync adapter for dbt Cloud Semantic Layer via persistent MCP session.
+
+    Call `connect()` once at startup.  All tool methods are sync and safe
+    to call from FastAPI request handlers.
     """
 
     def __init__(self):
-        self._host = settings.dbt_cloud_host.rstrip("/")
+        self._host = (settings.dbt_cloud_host or "").rstrip("/")
         self._token = settings.dbt_cloud_token
         self._env_id = settings.dbt_cloud_environment_id
+        self._mcp: Optional[_McpLoop] = None
         self._available = False
-        self._semantic_objects_cache: Optional[List[SemanticObject]] = None
-        self._cache_ts: float = 0.0
 
-    def _headers(self) -> Dict[str, str]:
+        self._metrics_cache: Optional[List[Dict]] = None
+        self._metrics_cache_ts: float = 0.0
+        self._dimensions_cache: Dict[str, List[Dict]] = {}
+        self._entities_cache: Dict[str, List[Dict]] = {}
+
+    def _mcp_url(self) -> str:
+        base = self._host
+        if not base.endswith("/api/ai/v1/mcp/"):
+            if not base.endswith("/"):
+                base += "/"
+            base += "api/ai/v1/mcp/"
+        return base
+
+    def _mcp_headers(self) -> Dict[str, str]:
         return {
             "Authorization": f"Token {self._token}",
             "x-dbt-prod-environment-id": self._env_id,
-            "Content-Type": "application/json",
         }
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def connect(self) -> bool:
+        if not self._host or not self._token or not self._env_id:
+            logger.info("dbt_cloud_not_configured")
+            return False
+        self._mcp = _McpLoop(self._mcp_url(), self._mcp_headers())
+        self._available = self._mcp.start()
+        return self._available
+
+    def check_availability(self) -> bool:
+        if self._available and self._mcp and self._mcp.connected:
+            return True
+        return self.connect()
 
     @property
     def is_available(self) -> bool:
         return self._available
 
-    def check_availability(self) -> bool:
-        """Probe dbt Cloud to see if the Semantic Layer is reachable."""
-        if not self._host or not self._token or not self._env_id:
-            logger.info("dbt_cloud_not_configured: missing host, token, or environment_id")
-            self._available = False
-            return False
+    # ------------------------------------------------------------------
+    # Semantic Layer tools (sync)
+    # ------------------------------------------------------------------
 
-        try:
-            resp = httpx.get(
-                f"{self._host}/api/ai/v1/mcp/",
-                headers=self._headers(),
-                timeout=_MCP_TIMEOUT,
-            )
-            # 406 means the server is reachable and auth is valid (it wants SSE)
-            self._available = resp.status_code in (200, 406)
-            if self._available:
-                logger.info("dbt_cloud_connected", extra={"extra": {"host": self._host}})
-            else:
-                logger.warning(f"dbt_cloud_unexpected_status: {resp.status_code}")
-        except Exception as exc:
-            logger.warning(f"dbt_cloud_unavailable: {exc}")
-            self._available = False
-        return self._available
-
-    def list_semantic_objects(self, refresh: bool = False) -> List[SemanticObject]:
-        """Enumerate all metrics, dimensions, entities from dbt Cloud Semantic Layer."""
-        cache_ttl = 300
+    def list_metrics(self, search: Optional[str] = None, refresh: bool = False) -> List[Dict]:
         if (
             not refresh
-            and self._semantic_objects_cache is not None
-            and (time.time() - self._cache_ts) < cache_ttl
+            and self._metrics_cache is not None
+            and (time.time() - self._metrics_cache_ts) < _CACHE_TTL
         ):
-            return self._semantic_objects_cache
+            metrics = self._metrics_cache
+            if search:
+                s = search.lower()
+                metrics = [m for m in metrics if s in m.get("name", "").lower()]
+            return metrics
 
-        objects: List[SemanticObject] = []
-        try:
-            metrics = self._call_tool("list_metrics", {}) or []
-            for m in self._parse_tool_result(metrics):
-                objects.append(SemanticObject(
-                    name=m.get("name", ""),
-                    object_type="metric",
-                    description=m.get("description", ""),
-                    meta=m,
-                ))
+        args: Dict[str, Any] = {}
+        if search:
+            args["search"] = search
+        raw = self._call("list_metrics", args)
+        metrics = raw if isinstance(raw, list) else []
+        self._metrics_cache = metrics
+        self._metrics_cache_ts = time.time()
+        if search:
+            s = search.lower()
+            metrics = [m for m in metrics if s in m.get("name", "").lower()]
+        return metrics
 
-            dimensions = self._call_tool("list_dimensions", {"metrics": []}) or []
-            for d in self._parse_tool_result(dimensions):
-                name = d if isinstance(d, str) else d.get("name", str(d))
-                objects.append(SemanticObject(
-                    name=name,
-                    object_type="dimension",
-                    description=d.get("description", "") if isinstance(d, dict) else "",
-                ))
+    def get_dimensions(self, metrics: List[str]) -> List[Dict]:
+        cache_key = ",".join(sorted(metrics))
+        if cache_key in self._dimensions_cache:
+            return self._dimensions_cache[cache_key]
+        raw = self._call("get_dimensions", {"metrics": metrics})
+        dims = raw if isinstance(raw, list) else []
+        self._dimensions_cache[cache_key] = dims
+        return dims
 
-            entities = self._call_tool("list_entities", {}) or []
-            for e in self._parse_tool_result(entities):
-                name = e if isinstance(e, str) else e.get("name", str(e))
-                objects.append(SemanticObject(
-                    name=name,
-                    object_type="entity",
-                ))
+    def get_entities(self, metrics: List[str]) -> List[Dict]:
+        cache_key = ",".join(sorted(metrics))
+        if cache_key in self._entities_cache:
+            return self._entities_cache[cache_key]
+        raw = self._call("get_entities", {"metrics": metrics})
+        ents = raw if isinstance(raw, list) else []
+        self._entities_cache[cache_key] = ents
+        return ents
 
-        except Exception as exc:
-            logger.warning(f"dbt_cloud_list_failed: {exc}")
-
-        self._semantic_objects_cache = objects
-        self._cache_ts = time.time()
-        return objects
-
-    def compile_query(
+    def query_metrics(
         self,
-        *,
-        metrics: Optional[List[str]] = None,
-        group_by: Optional[List[str]] = None,
-        where: Optional[List[str]] = None,
-        order_by: Optional[List[str]] = None,
+        metrics: List[str],
+        group_by: Optional[List[Dict]] = None,
+        order_by: Optional[List[Dict]] = None,
+        where: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> SemanticQueryResult:
-        """Ask dbt Cloud to compile a semantic query into SQL."""
-        t0 = time.perf_counter()
-        params: Dict[str, Any] = {}
-        if metrics:
-            params["metrics"] = metrics
+    ) -> List[Dict]:
+        args: Dict[str, Any] = {"metrics": metrics}
         if group_by:
-            params["group_by"] = group_by
-        if where:
-            params["where"] = where
+            args["group_by"] = group_by
         if order_by:
-            params["order_by"] = order_by
+            args["order_by"] = order_by
+        if where:
+            args["where"] = where
         if limit is not None:
-            params["limit"] = limit
+            args["limit"] = limit
+        logger.info("mcp_query_metrics_args", extra={"extra": {
+            "metrics": metrics,
+            "group_by": group_by,
+            "has_order_by": order_by is not None,
+            "has_where": where is not None,
+            "limit": limit,
+        }})
+        raw = self._call("query_metrics", args)
+        row_count = len(raw) if isinstance(raw, list) else 0
+        logger.info(f"mcp_query_metrics_result: {row_count} rows, type={type(raw).__name__}")
+        return raw if isinstance(raw, list) else []
 
-        try:
-            result = self._call_tool("get_metrics_compiled_sql", params)
-            compile_ms = (time.perf_counter() - t0) * 1000
+    def get_compiled_sql(
+        self,
+        metrics: List[str],
+        group_by: Optional[List[Dict]] = None,
+        order_by: Optional[List[Dict]] = None,
+        where: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> str:
+        args: Dict[str, Any] = {"metrics": metrics}
+        if group_by:
+            args["group_by"] = group_by
+        if order_by:
+            args["order_by"] = order_by
+        if where:
+            args["where"] = where
+        if limit is not None:
+            args["limit"] = limit
+        raw = self._call("get_metrics_compiled_sql", args)
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict):
+            return raw.get("sql", raw.get("compiled_sql", str(raw)))
+        return str(raw) if raw else ""
 
-            sql = ""
-            objects_used = list(metrics or [])
-            objects_used.extend(group_by or [])
+    def text_to_sql(self, text: str) -> str:
+        raw = self._call("text_to_sql", {"text": text})
+        if isinstance(raw, str):
+            return raw
+        return str(raw) if raw else ""
 
-            parsed = self._parse_tool_result(result)
-            if isinstance(parsed, dict):
-                sql = parsed.get("sql", parsed.get("compiled_sql", ""))
-            elif isinstance(parsed, str):
-                sql = parsed
-
-            return SemanticQueryResult(
-                sql=sql,
-                semantic_objects_used=objects_used,
-                compile_ms=round(compile_ms, 1),
-                meta=parsed if isinstance(parsed, dict) else {"raw": parsed},
-            )
-
-        except Exception as exc:
-            compile_ms = (time.perf_counter() - t0) * 1000
-            logger.error(f"dbt_cloud_compile_failed: {exc}")
-            return SemanticQueryResult(
-                sql="",
-                semantic_objects_used=[],
-                compile_ms=round(compile_ms, 1),
-                meta={"error": str(exc)},
-            )
+    # ------------------------------------------------------------------
+    # High-level helpers
+    # ------------------------------------------------------------------
 
     def get_semantic_context_for_search(self) -> Dict[str, Any]:
-        """Return a summary of available semantic context for explainability."""
-        objects = self.list_semantic_objects()
+        metrics = self.list_metrics()
+        metric_names = [m.get("name", "") for m in metrics]
         return {
-            "metrics": [o.name for o in objects if o.object_type == "metric"],
-            "dimensions": [o.name for o in objects if o.object_type == "dimension"],
-            "entities": [o.name for o in objects if o.object_type == "entity"],
-            "object_count": len(objects),
+            "metrics": metric_names,
+            "metric_details": metrics,
+            "object_count": len(metrics),
         }
 
+    def list_semantic_objects(self, refresh: bool = False) -> List[SemanticObject]:
+        objects: List[SemanticObject] = []
+        for m in self.list_metrics(refresh=refresh):
+            objects.append(SemanticObject(
+                name=m.get("name", ""),
+                object_type="metric",
+                description=m.get("description", ""),
+                meta=m,
+            ))
+        return objects
+
     # ------------------------------------------------------------------
-    # MCP HTTP transport
+    # Internal
     # ------------------------------------------------------------------
 
-    def _call_tool(self, tool_name: str, params: Dict[str, Any]) -> Any:
-        """Call a tool on the dbt Cloud remote MCP endpoint via JSON-RPC."""
-        url = f"{self._host}/api/ai/v1/mcp/"
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": params,
-            },
-        }
+    def _call(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        if not self._mcp or not self._mcp.connected:
+            if not self.connect():
+                raise RuntimeError("dbt Cloud MCP not connected")
 
-        logger.info("dbt_cloud_call", extra={"extra": {
-            "tool": tool_name,
-            "params_keys": list(params.keys()),
-        }})
-
-        resp = httpx.post(
-            url,
-            json=payload,
-            headers=self._headers(),
-            timeout=_MCP_TIMEOUT,
-        )
-        resp.raise_for_status()
-
-        body = resp.json()
-        if "error" in body:
-            raise RuntimeError(f"dbt MCP error: {body['error']}")
-
-        return body.get("result", body)
-
-    @staticmethod
-    def _parse_tool_result(result: Any) -> Any:
-        """Normalize the MCP tool result into a usable Python object."""
-        if result is None:
-            return []
-        if isinstance(result, dict) and "content" in result:
-            content = result["content"]
-            if isinstance(content, list) and content:
-                first = content[0]
-                if isinstance(first, dict) and "text" in first:
-                    try:
-                        return json.loads(first["text"])
-                    except (json.JSONDecodeError, TypeError):
-                        return first["text"]
-            return content
-        if isinstance(result, str):
-            try:
-                return json.loads(result)
-            except json.JSONDecodeError:
-                return result
-        return result
+        t0 = time.perf_counter()
+        try:
+            result = self._mcp.call_tool(tool_name, args)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info("mcp_tool_call", extra={"extra": {
+                "tool": tool_name,
+                "elapsed_ms": round(elapsed_ms, 1),
+            }})
+            return result
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.error(f"mcp_tool_error: {tool_name} ({elapsed_ms:.0f}ms): {exc}")
+            self._available = False
+            raise
 
 
 _dbt_mcp_service: Optional[DbtMcpService] = None

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
+from typing import Any, Dict, Optional, List, Literal
 from datetime import date
 from .domain import OrderStatusPayload
 
@@ -27,16 +27,31 @@ class MatchedOrder(OrderStatusPayload):
 
 
 class TimingsMs(BaseModel):
-    sql_candidate_ms: float
-    cortex_rerank_ms: float
-    sql_fetch_top_ms: float
-    total_ms: float
+    sql_candidate_ms: float = 0.0
+    cortex_rerank_ms: float = 0.0
+    sql_fetch_top_ms: float = 0.0
+    cortex_parse_ms: float = 0.0
+    mcp_query_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+class MetricResult(BaseModel):
+    """Tabular result from a dbt Semantic Layer metric query."""
+    columns: List[str]
+    rows: List[Dict[str, Any]]
+    row_count: int
+    metrics_used: List[str]
+    dimensions_used: List[str]
+    compiled_sql: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
     trace_id: str
-    results: List[MatchedOrder]
+    response_type: Literal["order_lookup", "metric_query"] = "order_lookup"
+    results: List[MatchedOrder] = []
+    metric_result: Optional[MetricResult] = None
     timings_ms: TimingsMs
-    candidate_count: int
+    candidate_count: int = 0
     candidate_sql: Optional[str] = None
     fetch_sql: Optional[str] = None
+    semantic_backend: Optional[str] = None

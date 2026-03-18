@@ -1,19 +1,27 @@
 """SemanticService — stable orchestration contract.
 
-This is the single entry point for all order-lookup logic.
+This is the single entry point for all search logic.
 Future Agentforce / Tableau Next clients call the same methods.
 
-Pipeline:
-  1. (Optional) dbt MCP → semantic context for governed meaning
-  2. FuzzyService  → deterministic candidate SQL + scoring
-  3. SnowflakeService → execute candidate query
-  4. CortexService → parse free-text (if needed) + rerank
-  5. SnowflakeService → fetch full payload for top N
-  6. ExplainService → package artifacts
-  7. Trace log → write to DEMO_BSC.DEMO_TRACE_LOG
+Two pipelines depending on intent:
+
+  ORDER LOOKUP (intent="order_lookup"):
+    1. FuzzyService  → deterministic candidate SQL + scoring
+    2. SnowflakeService → execute candidate query
+    3. CortexService → parse free-text (if needed) + rerank
+    4. SnowflakeService → fetch full payload for top N
+    5. ExplainService → package artifacts
+
+  METRIC QUERY (intent="metric_query"):
+    1. CortexService → classify intent + build query_metrics params
+    2. DbtMcpService → query_metrics via Semantic Layer
+    3. Return tabular metric results
+
+Both paths log a trace (trace_id + timings).
 """
 
 import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -24,7 +32,13 @@ from api.core.log import get_logger
 from api.core.timing import Timer
 from api.schemas.domain import CandidateSummary, OrderStatusPayload
 from api.schemas.explain import ExplainResponse
-from api.schemas.search import MatchedOrder, SearchRequest, SearchResponse, TimingsMs
+from api.schemas.search import (
+    MatchedOrder,
+    MetricResult,
+    SearchRequest,
+    SearchResponse,
+    TimingsMs,
+)
 from api.schemas.trace import TraceLog
 from api.services.cortex_service import CortexService, RerankResult
 from api.services.dbt_mcp_service import DbtMcpService
@@ -34,7 +48,6 @@ from api.services.snowflake_service import SnowflakeService
 
 logger = get_logger(__name__)
 
-# SQL to fetch full payloads for a list of order_ids
 _FETCH_ORDERS_SQL = """
     SELECT
         order_id, purchase_order_id, status, status_last_updated_ts,
@@ -99,6 +112,233 @@ class SemanticService:
     def search_orders(self, request: SearchRequest) -> SearchResponse:
         trace_id = str(uuid.uuid4())
         timer = Timer()
+
+        if request.mode == "free_text" and request.free_text:
+            is_metric = self._classify_intent(request.free_text)
+
+            if is_metric and self._dbt_mcp_available:
+                return self._handle_metric_query(
+                    trace_id=trace_id,
+                    timer=timer,
+                    question=request.free_text,
+                    original_request=request,
+                )
+
+            # Order lookup (with Cortex parse for field extraction)
+            with timer.segment("cortex_parse"):
+                intent = self._cortex.parse_user_input(request.free_text)
+            return self._handle_order_lookup(
+                trace_id=trace_id,
+                timer=timer,
+                request=request,
+                pre_parsed_intent=intent,
+            )
+
+        return self._handle_order_lookup(
+            trace_id=trace_id,
+            timer=timer,
+            request=request,
+        )
+
+    @staticmethod
+    def _classify_intent(text: str) -> bool:
+        """Fast keyword-based intent classification. Returns True for metric queries."""
+        t = text.lower()
+        METRIC_PATTERNS = [
+            "how many", "count", "total", "average", "avg ",
+            "trend", "breakdown", "by status", "by region",
+            "by month", "by year", "by quarter", "by week",
+            "revenue", "fulfillment rate", "top ", "sum ",
+            "percentage", "units ordered", "line items",
+            "over time", "compare", "statistics", "aggregate",
+        ]
+        ORDER_PATTERNS = [
+            "order for", "find order", "track", "where is",
+            "status of", "shipping", "delivery for", "po-",
+            "so-", "purchase order", "specific order",
+        ]
+        metric_score = sum(1 for p in METRIC_PATTERNS if p in t)
+        order_score = sum(1 for p in ORDER_PATTERNS if p in t)
+        return metric_score > order_score
+
+    def get_order_status(self, order_id: str) -> OrderStatusPayload:
+        """Direct single-order lookup by exact order_id."""
+        sql = """
+            SELECT
+                order_id, purchase_order_id, status, status_last_updated_ts,
+                customer_name, facility_name, promised_delivery_date,
+                carrier, tracking_number, actual_ship_ts, actual_delivery_date,
+                priority_flag, requested_ship_date, total_amount_usd, currency,
+                sales_region
+            FROM DEMO_BSC.ORDER_SEARCH_V
+            WHERE order_id = %(order_id)s
+            LIMIT 1
+        """
+        result = self._sf.execute(sql, {"order_id": order_id}, label="get_order_status")
+        if not result.rows:
+            raise OrderNotFoundError(order_id)
+        row = result.rows[0]
+        return OrderStatusPayload(
+            order_id=row["ORDER_ID"],
+            purchase_order_id=row.get("PURCHASE_ORDER_ID"),
+            status=row["STATUS"],
+            status_last_updated_ts=row["STATUS_LAST_UPDATED_TS"],
+            customer_name=row["CUSTOMER_NAME"],
+            facility_name=row["FACILITY_NAME"],
+            promised_delivery_date=row.get("PROMISED_DELIVERY_DATE"),
+            carrier=row.get("CARRIER"),
+            tracking_number=row.get("TRACKING_NUMBER"),
+            actual_ship_ts=row.get("ACTUAL_SHIP_TS"),
+            actual_delivery_date=row.get("ACTUAL_DELIVERY_DATE"),
+            priority_flag=row.get("PRIORITY_FLAG"),
+            requested_ship_date=row.get("REQUESTED_SHIP_DATE"),
+            total_amount_usd=row.get("TOTAL_AMOUNT_USD"),
+            currency=row.get("CURRENCY"),
+            sales_region=row.get("SALES_REGION"),
+        )
+
+    def explain(self, trace_id: str) -> ExplainResponse:
+        resp = self._explain_store.get(trace_id)
+        if resp is None:
+            raise OrderNotFoundError(f"trace:{trace_id}")
+        return resp
+
+    # ------------------------------------------------------------------
+    # METRIC QUERY pipeline
+    # ------------------------------------------------------------------
+
+    def _handle_metric_query(
+        self,
+        *,
+        trace_id: str,
+        timer: Timer,
+        question: str,
+        original_request: SearchRequest,
+        parse_prompt_used: Optional[str] = None,
+    ) -> SearchResponse:
+        error_str: Optional[str] = None
+        metric_result: Optional[MetricResult] = None
+        semantic_objects_used: List[str] = []
+
+        try:
+            metrics_list = self._dbt_mcp.list_metrics()
+            metric_names = [m.get("name", "") for m in metrics_list]
+            sample_metrics = metric_names[:5] if metric_names else []
+            dims_list = self._dbt_mcp.get_dimensions(sample_metrics) if sample_metrics else []
+
+            # Map dimension types for the LLM
+            mapped_dims = []
+            for d in dims_list:
+                dtype = d.get("type", "CATEGORICAL")
+                mapped_type = "time_dimension" if dtype == "TIME" else "dimension"
+                mapped_dims.append({"name": d.get("name", ""), "type": mapped_type})
+
+            with timer.segment("cortex_parse"):
+                query_params = self._cortex.build_metric_query_params(
+                    question=question,
+                    available_metrics=metrics_list,
+                    available_dimensions=mapped_dims,
+                )
+            query_params = self._normalize_metric_params(query_params) or {}
+
+            if not query_params.get("metrics"):
+                logger.warning("metric_query_no_metrics_matched", extra={
+                    "extra": {"question": question[:100]}
+                })
+                return SearchResponse(
+                    trace_id=trace_id,
+                    response_type="metric_query",
+                    timings_ms=TimingsMs(total_ms=timer.total_ms(), cortex_parse_ms=timer.get("cortex_parse")),
+                    semantic_backend="dbt_mcp",
+                )
+
+            semantic_objects_used = query_params.get("metrics", [])
+
+            with timer.segment("mcp_query"):
+                rows = self._dbt_mcp.query_metrics(
+                    metrics=query_params["metrics"],
+                    group_by=query_params.get("group_by"),
+                    order_by=query_params.get("order_by"),
+                    where=query_params.get("where"),
+                    limit=query_params.get("limit"),
+                )
+
+            columns = list(rows[0].keys()) if rows else []
+            dimensions_used = [
+                g.get("name", "") for g in (query_params.get("group_by") or [])
+            ]
+
+            metric_result = MetricResult(
+                columns=columns,
+                rows=rows,
+                row_count=len(rows),
+                metrics_used=query_params["metrics"],
+                dimensions_used=dimensions_used,
+                compiled_sql=None,
+            )
+
+        except Exception as exc:
+            error_str = str(exc)
+            logger.error(f"metric_query_error: {exc}", extra={"extra": {"trace_id": trace_id}})
+
+        timings = TimingsMs(
+            cortex_parse_ms=timer.get("cortex_parse"),
+            mcp_query_ms=timer.get("mcp_query"),
+            total_ms=timer.total_ms(),
+        )
+
+        self._write_trace(
+            trace_id=trace_id,
+            request=original_request,
+            timings=timings,
+            candidate_count=metric_result.row_count if metric_result else 0,
+            chosen_ids=[],
+            candidate_sql_hash="",
+            fetch_sql_hash="",
+            snowflake_query_ids={},
+            error=error_str,
+        )
+
+        explain_resp = self._explain.build_explain_response(
+            trace_id=trace_id,
+            candidate_sql="(metric query via dbt Semantic Layer)",
+            candidate_count=metric_result.row_count if metric_result else 0,
+            top_candidates_pre_rerank=[],
+            rerank_result=RerankResult(ranked_ids=[], rationale={}, prompt_used=""),
+            fetch_sql="",
+            timings_ms=timings,
+            prompt_versions={
+                "parse": settings.parse_prompt_version,
+                "rerank": settings.rerank_prompt_version,
+            },
+            snowflake_query_ids={},
+            parse_prompt_used=parse_prompt_used,
+            normalized_request={"intent": "metric_query", "question": question},
+            semantic_objects_used=semantic_objects_used,
+            semantic_backend="dbt_mcp",
+        )
+        self._explain_store[trace_id] = explain_resp
+
+        return SearchResponse(
+            trace_id=trace_id,
+            response_type="metric_query",
+            metric_result=metric_result,
+            timings_ms=timings,
+            semantic_backend="dbt_mcp",
+        )
+
+    # ------------------------------------------------------------------
+    # ORDER LOOKUP pipeline (existing)
+    # ------------------------------------------------------------------
+
+    def _handle_order_lookup(
+        self,
+        *,
+        trace_id: str,
+        timer: Timer,
+        request: SearchRequest,
+        pre_parsed_intent=None,
+    ) -> SearchResponse:
         snowflake_query_ids: Dict[str, str] = {}
         error_str: Optional[str] = None
         rerank_result: RerankResult = RerankResult(
@@ -110,26 +350,27 @@ class SemanticService:
         candidate_count = 0
         candidates: List[CandidateSummary] = []
         semantic_objects_used: List[str] = []
+        parse_prompt_used: Optional[str] = None
 
         try:
-            # ── Step 0a: dbt MCP semantic context (if available) ──────
+            # Step 0a: dbt MCP semantic context (if available)
             if self._dbt_mcp_available and self._dbt_mcp:
                 try:
                     ctx = self._dbt_mcp.get_semantic_context_for_search()
-                    semantic_objects_used = ctx.get("metrics", []) + ctx.get("dimensions", [])
-                    logger.info("dbt_mcp_context", extra={"extra": {
-                        "trace_id": trace_id,
-                        "semantic_objects": len(semantic_objects_used),
-                    }})
+                    semantic_objects_used = ctx.get("metrics", [])
                 except Exception as exc:
                     logger.warning(f"dbt_mcp_context_failed: {exc}")
-            # ── Step 0: parse free text if needed ──────────────────────
-            parse_prompt_used: Optional[str] = None
+
+            # Step 0: parse free text if needed
             if request.mode == "free_text" and request.free_text:
-                with timer.segment("cortex_parse"):
-                    intent = self._cortex.parse_user_input(request.free_text)
+                if pre_parsed_intent:
+                    intent = pre_parsed_intent
                     parse_prompt_used = intent.raw_response
-                # Merge parsed intent into request fields (fields win if already set)
+                else:
+                    with timer.segment("cortex_parse"):
+                        intent = self._cortex.parse_user_input(request.free_text)
+                        parse_prompt_used = intent.raw_response
+
                 f = request.fields
                 f.order_id = f.order_id or intent.order_id
                 f.purchase_order_id = f.purchase_order_id or intent.purchase_order_id
@@ -149,7 +390,7 @@ class SemanticService:
                         pass
                 f.contact_name = f.contact_name or intent.contact_name
 
-            # ── Step 1: deterministic candidate retrieval ───────────────
+            # Step 1: deterministic candidate retrieval
             normalized = self._fuzzy.normalize_inputs(request)
             plan = self._fuzzy.build_candidate_query(normalized)
             candidate_sql = plan.sql
@@ -163,11 +404,10 @@ class SemanticService:
             candidates = self._fuzzy.score_candidates(cand_result.rows)
             candidate_count = len(candidates)
 
-            # ── Step 2: Cortex reranking ────────────────────────────────
+            # Step 2: Cortex reranking
             query_str = request.free_text or self._summarize_fields(request)
 
             if plan.is_exact or candidate_count == 0:
-                # Skip rerank for direct ID lookups or empty results
                 rerank_result = RerankResult(
                     ranked_ids=[c.order_id for c in candidates[: request.top_n]],
                     rationale={c.order_id: "Exact ID match" for c in candidates[: request.top_n]},
@@ -183,7 +423,7 @@ class SemanticService:
                         top_n=request.top_n,
                     )
 
-            # ── Step 3: final fetch ─────────────────────────────────────
+            # Step 3: final fetch
             top_ids = rerank_result.ranked_ids or [
                 c.order_id for c in candidates[: request.top_n]
             ]
@@ -199,7 +439,6 @@ class SemanticService:
                     )
                     snowflake_query_ids["fetch_top"] = fetch_result.query_id
 
-                # Build a score lookup from candidates
                 score_map = {c.order_id: c.score for c in candidates}
                 rows_by_id = {row["ORDER_ID"]: row for row in fetch_result.rows}
 
@@ -246,6 +485,7 @@ class SemanticService:
                 sql_candidate_ms=timer.get("sql_candidate"),
                 cortex_rerank_ms=timer.get("cortex_rerank") + getattr(rerank_result, "elapsed_ms", 0.0),
                 sql_fetch_top_ms=timer.get("sql_fetch_top"),
+                cortex_parse_ms=timer.get("cortex_parse"),
                 total_ms=timer.total_ms(),
             )
             self._write_trace(
@@ -262,11 +502,13 @@ class SemanticService:
 
         response = SearchResponse(
             trace_id=trace_id,
+            response_type="order_lookup",
             results=matched_orders,
             timings_ms=timings,
             candidate_count=candidate_count,
             candidate_sql=candidate_sql.strip(),
             fetch_sql=fetch_sql.strip(),
+            semantic_backend=settings.semantic_backend,
         )
 
         explain_resp = self._explain.build_explain_response(
@@ -291,51 +533,38 @@ class SemanticService:
 
         return response
 
-    def get_order_status(self, order_id: str) -> OrderStatusPayload:
-        """Direct single-order lookup by exact order_id."""
-        sql = """
-            SELECT
-                order_id, purchase_order_id, status, status_last_updated_ts,
-                customer_name, facility_name, promised_delivery_date,
-                carrier, tracking_number, actual_ship_ts, actual_delivery_date,
-                priority_flag, requested_ship_date, total_amount_usd, currency,
-                sales_region
-            FROM DEMO_BSC.ORDER_SEARCH_V
-            WHERE order_id = %(order_id)s
-            LIMIT 1
-        """
-        result = self._sf.execute(sql, {"order_id": order_id}, label="get_order_status")
-        if not result.rows:
-            raise OrderNotFoundError(order_id)
-        row = result.rows[0]
-        return OrderStatusPayload(
-            order_id=row["ORDER_ID"],
-            purchase_order_id=row.get("PURCHASE_ORDER_ID"),
-            status=row["STATUS"],
-            status_last_updated_ts=row["STATUS_LAST_UPDATED_TS"],
-            customer_name=row["CUSTOMER_NAME"],
-            facility_name=row["FACILITY_NAME"],
-            promised_delivery_date=row.get("PROMISED_DELIVERY_DATE"),
-            carrier=row.get("CARRIER"),
-            tracking_number=row.get("TRACKING_NUMBER"),
-            actual_ship_ts=row.get("ACTUAL_SHIP_TS"),
-            actual_delivery_date=row.get("ACTUAL_DELIVERY_DATE"),
-            priority_flag=row.get("PRIORITY_FLAG"),
-            requested_ship_date=row.get("REQUESTED_SHIP_DATE"),
-            total_amount_usd=row.get("TOTAL_AMOUNT_USD"),
-            currency=row.get("CURRENCY"),
-            sales_region=row.get("SALES_REGION"),
-        )
-
-    def explain(self, trace_id: str) -> ExplainResponse:
-        resp = self._explain_store.get(trace_id)
-        if resp is None:
-            raise OrderNotFoundError(f"trace:{trace_id}")
-        return resp
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_metric_params(params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Ensure LLM-produced metric params match the MCP tool schema."""
+        if not params or not params.get("metrics"):
+            return params
+        TYPE_MAP = {"CATEGORICAL": "dimension", "TIME": "time_dimension"}
+        if params.get("group_by"):
+            normalized_gb = []
+            for gb in params["group_by"]:
+                raw_type = gb.get("type", "dimension")
+                gb_type = TYPE_MAP.get(raw_type.upper(), raw_type)
+                if gb_type not in ("dimension", "time_dimension", "entity"):
+                    gb_type = "dimension"
+                normalized_gb.append({
+                    "name": gb["name"],
+                    "type": gb_type,
+                    "grain": gb.get("grain"),
+                })
+            params["group_by"] = normalized_gb
+        if params.get("order_by"):
+            normalized_ob = []
+            for ob in params["order_by"]:
+                normalized_ob.append({
+                    "name": ob["name"],
+                    "descending": ob.get("descending", False),
+                })
+            params["order_by"] = normalized_ob
+        return params
 
     @staticmethod
     def _build_fetch_sql(order_ids: List[str]) -> str:

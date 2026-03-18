@@ -17,7 +17,9 @@ def health(sf: SnowflakeService = Depends(get_snowflake_service)):
     if dbt_cloud_configured:
         try:
             svc = get_dbt_mcp_service()
-            dbt_cloud_ok = svc.check_availability()
+            dbt_cloud_ok = svc.is_available
+            if not dbt_cloud_ok:
+                dbt_cloud_ok = svc.check_availability()
         except Exception:
             dbt_cloud_ok = False
 
@@ -27,4 +29,5 @@ def health(sf: SnowflakeService = Depends(get_snowflake_service)):
         "snowflake": sf_ok,
         "dbt_cloud": dbt_cloud_ok,
         "dbt_cloud_configured": dbt_cloud_configured,
+        "semantic_backend": settings.semantic_backend,
     }

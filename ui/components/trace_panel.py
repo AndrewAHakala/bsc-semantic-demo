@@ -12,18 +12,38 @@ def render_trace_panel(
 ) -> None:
     st.subheader("Performance")
 
-    # Current request timings
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Candidate SQL", f"{timings.get('sql_candidate_ms', 0):.0f} ms")
-    col2.metric("Cortex Rerank", f"{timings.get('cortex_rerank_ms', 0):.0f} ms")
-    col3.metric("Final Fetch", f"{timings.get('sql_fetch_top_ms', 0):.0f} ms")
-    col4.metric(
-        "Total",
-        f"{timings.get('total_ms', 0):.0f} ms",
-        delta=(
-            f"{'✅ under 5s' if timings.get('total_ms', 0) < 5000 else '⚠️ over SLO'}"
-        ),
-        delta_color="normal",
+    total_ms = timings.get("total_ms", 0)
+    cortex_parse = timings.get("cortex_parse_ms", 0)
+    mcp_query = timings.get("mcp_query_ms", 0)
+    sql_cand = timings.get("sql_candidate_ms", 0)
+    cortex_rerank = timings.get("cortex_rerank_ms", 0)
+    sql_fetch = timings.get("sql_fetch_top_ms", 0)
+
+    # Show the relevant metrics based on what has values
+    cols = st.columns(5)
+    idx = 0
+    if cortex_parse > 0:
+        cols[idx].metric("Cortex Parse", f"{cortex_parse:.0f} ms")
+        idx += 1
+    if mcp_query > 0:
+        cols[idx].metric("MCP Query", f"{mcp_query:.0f} ms")
+        idx += 1
+    if sql_cand > 0:
+        cols[idx].metric("Candidate SQL", f"{sql_cand:.0f} ms")
+        idx += 1
+    if cortex_rerank > 0:
+        cols[idx].metric("Cortex Rerank", f"{cortex_rerank:.0f} ms")
+        idx += 1
+    if sql_fetch > 0:
+        cols[idx].metric("Final Fetch", f"{sql_fetch:.0f} ms")
+        idx += 1
+
+    slo_label = "under 5s" if total_ms < 5000 else "over SLO"
+    st.metric(
+        "Total End-to-End",
+        f"{total_ms:.0f} ms",
+        delta=slo_label,
+        delta_color="normal" if total_ms < 5000 else "inverse",
     )
 
     st.caption(f"Trace ID: `{trace_id}`")
@@ -31,15 +51,17 @@ def render_trace_panel(
     # History table
     if history:
         st.markdown("---")
-        st.markdown("**Last requests**")
+        st.markdown("**Request history**")
         df = pd.DataFrame(history)
         display_cols = [
-            c for c in ["trace_id", "total_ms", "sql_candidate_ms", "cortex_rerank_ms", "sql_fetch_top_ms"]
+            c for c in [
+                "trace_id", "type", "total_ms", "cortex_parse_ms",
+                "mcp_query_ms", "sql_candidate_ms", "cortex_rerank_ms", "sql_fetch_top_ms",
+            ]
             if c in df.columns
         ]
         st.dataframe(df[display_cols].tail(20), use_container_width=True, hide_index=True)
 
-        # p50 / p95
         if "total_ms" in df.columns and len(df) >= 2:
             p50 = df["total_ms"].quantile(0.50)
             p95 = df["total_ms"].quantile(0.95)
