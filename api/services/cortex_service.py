@@ -177,12 +177,7 @@ class CortexService:
     def _complete(self, prompt: str, *, label: str = "cortex") -> str:
         """Call SNOWFLAKE.CORTEX.COMPLETE and return the text response."""
         sql = """
-            SELECT SNOWFLAKE.CORTEX.COMPLETE(
-                %(model)s,
-                ARRAY_CONSTRUCT(
-                    OBJECT_CONSTRUCT('role', 'user', 'content', %(prompt)s)
-                )
-            ) AS response
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(%(model)s, %(prompt)s) AS response
         """
         try:
             result = self._sf.execute(
@@ -193,7 +188,6 @@ class CortexService:
             if not result.rows:
                 raise CortexError(f"Empty response from Cortex [{label}]")
             raw = result.rows[0].get("RESPONSE", "") or ""
-            # Cortex returns a JSON string with a choices array
             return self._extract_content(raw)
         except Exception as exc:
             raise CortexError(str(exc)) from exc

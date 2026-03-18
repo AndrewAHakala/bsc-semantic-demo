@@ -1,20 +1,15 @@
 {% macro normalize_text(column_name) %}
     {#-
     Snowflake-compatible text normalization for fuzzy search matching.
-    Strips accents (via TRANSLATE), lowercases, removes punctuation,
-    and collapses whitespace.
+    Lowercases, strips non-alphanumeric characters, and collapses whitespace.
     -#}
-    regexp_replace(
+    trim(
         regexp_replace(
-            lower(
-                translate(
-                    {{ column_name }},
-                    'ÀÁÂÃÄÅÈÉÊËÌÍÎÏÒÓÔÕÖÙÚÛÜÝàáâãäåèéêëìíîïòóôõöùúûüý',
-                    'AAAAAAEEEEIIIIOOOOOUUUUYaaaaaaeeeeiiiioooooouuuuy'
-                )
+            regexp_replace(
+                lower({{ column_name }}),
+                '[^a-z0-9\\s]', ' '
             ),
-            '[^a-z0-9\\s]', ' '
-        ),
-        '\\s+', ' '
+            '\\s+', ' '
+        )
     )
 {% endmacro %}

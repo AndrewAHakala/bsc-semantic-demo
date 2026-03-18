@@ -80,10 +80,17 @@ class DbtMcpService:
             return False
 
         try:
-            result = self._call_tool("list_metrics", {})
-            self._available = result is not None
+            resp = httpx.get(
+                f"{self._host}/api/ai/v1/mcp/",
+                headers=self._headers(),
+                timeout=_MCP_TIMEOUT,
+            )
+            # 406 means the server is reachable and auth is valid (it wants SSE)
+            self._available = resp.status_code in (200, 406)
             if self._available:
                 logger.info("dbt_cloud_connected", extra={"extra": {"host": self._host}})
+            else:
+                logger.warning(f"dbt_cloud_unexpected_status: {resp.status_code}")
         except Exception as exc:
             logger.warning(f"dbt_cloud_unavailable: {exc}")
             self._available = False

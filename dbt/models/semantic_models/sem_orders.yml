@@ -98,7 +98,7 @@ semantic_models:
         expr: days_to_last_update
 
 metrics:
-  - name: order_volume
+  - name: order_count
     description: Total number of orders
     type: simple
     type_params:
@@ -116,28 +116,6 @@ metrics:
     type_params:
       measure: avg_order_value
 
-  - name: fulfillment_rate
-    description: Percentage of orders that have been shipped or delivered
-    type: derived
-    type_params:
-      expr: fulfilled_order_count * 1.0 / nullif(order_count, 0)
-      metrics:
-        - name: fulfilled_order_count
-          offset_window: null
-        - name: order_count
-          offset_window: null
-
-  - name: priority_rate
-    description: Percentage of orders flagged as priority
-    type: derived
-    type_params:
-      expr: priority_order_count * 1.0 / nullif(order_count, 0)
-      metrics:
-        - name: priority_order_count
-          offset_window: null
-        - name: order_count
-          offset_window: null
-
   - name: fulfilled_order_count
     description: Count of fulfilled (shipped/delivered) orders
     type: simple
@@ -149,3 +127,21 @@ metrics:
     type: simple
     type_params:
       measure: priority_order_count
+
+  - name: fulfillment_rate
+    description: Percentage of orders that have been shipped or delivered
+    type: derived
+    type_params:
+      expr: fulfilled_order_count * 1.0 / nullif(order_count, 0)
+      metrics:
+        - name: fulfilled_order_count
+        - name: order_count
+
+  - name: priority_rate
+    description: Percentage of orders flagged as priority
+    type: derived
+    type_params:
+      expr: priority_order_count * 1.0 / nullif(order_count, 0)
+      metrics:
+        - name: priority_order_count
+        - name: order_count

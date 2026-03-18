@@ -70,37 +70,46 @@ class SnowflakeService:
         sql_hash = hashlib.sha256(sql.encode()).hexdigest()[:16]
         params = params or {}
 
-        conn = self._get_conn()
-        cur = conn.cursor(snowflake.connector.DictCursor)
-        t0 = time.perf_counter()
-        try:
-            cur.execute(sql, params)
-            rows = cur.fetchmany(settings.query_max_rows)
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            query_id = cur.sfqid or ""
-            logger.info(
-                "snowflake_query",
-                extra={
-                    "extra": {
-                        "label": label,
-                        "query_id": query_id,
-                        "rows": len(rows),
-                        "elapsed_ms": round(elapsed_ms, 1),
-                        "sql_hash": sql_hash,
-                    }
-                },
-            )
-            return QueryResult(
-                rows=rows,
-                query_id=query_id,
-                elapsed_ms=round(elapsed_ms, 1),
-                sql_hash=sql_hash,
-            )
-        except snowflake.connector.errors.ProgrammingError as exc:
-            logger.error(f"Snowflake query error [{label}]: {exc}")
-            raise
-        finally:
-            cur.close()
+        for attempt in range(2):
+            conn = self._get_conn()
+            cur = conn.cursor(snowflake.connector.DictCursor)
+            t0 = time.perf_counter()
+            try:
+                cur.execute(sql, params)
+                rows = cur.fetchmany(settings.query_max_rows)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                query_id = cur.sfqid or ""
+                logger.info(
+                    "snowflake_query",
+                    extra={
+                        "extra": {
+                            "label": label,
+                            "query_id": query_id,
+                            "rows": len(rows),
+                            "elapsed_ms": round(elapsed_ms, 1),
+                            "sql_hash": sql_hash,
+                        }
+                    },
+                )
+                return QueryResult(
+                    rows=rows,
+                    query_id=query_id,
+                    elapsed_ms=round(elapsed_ms, 1),
+                    sql_hash=sql_hash,
+                )
+            except snowflake.connector.errors.DatabaseError as exc:
+                cur.close()
+                if attempt == 0 and "Authentication token has expired" in str(exc):
+                    logger.warning("snowflake_token_expired, reconnecting")
+                    self._conn = None
+                    continue
+                logger.error(f"Snowflake query error [{label}]: {exc}")
+                raise
+            except snowflake.connector.errors.ProgrammingError as exc:
+                logger.error(f"Snowflake query error [{label}]: {exc}")
+                raise
+            finally:
+                cur.close()
 
     def healthcheck(self) -> bool:
         try:
@@ -126,23 +135,24 @@ class SnowflakeService:
         exempt_dbs = {"SNOWFLAKE"}
         exempt_schemas = {"INFORMATION_SCHEMA", "CORTEX"}
 
-        # 3-part: DATABASE.SCHEMA.TABLE/FUNCTION
-        for db, schema, _obj in re.findall(
-            r"([A-Z_][A-Z0-9_]*)\.([A-Z_][A-Z0-9_]*)\.([A-Z_][A-Z0-9_]*)", sql_upper
+        # Find complete dot-separated identifier chains (e.g. DB.SCHEMA.TABLE)
+        # to avoid regex backtracking issues with partial matches.
+        for chain in re.findall(
+            r"[A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)+", sql_upper
         ):
-            if db in exempt_dbs or schema in exempt_schemas:
-                continue
-            if schema not in allowed:
-                raise SchemaNotAllowedError(schema)
-
-        # 2-part: SCHEMA.TABLE (not preceded by a dot, so not part of a 3-part ref)
-        for schema, _obj in re.findall(
-            r"(?<!\.)([A-Z_][A-Z0-9_]*)\.([A-Z_][A-Z0-9_]*)(?!\.)", sql_upper
-        ):
-            if schema in exempt_dbs or schema in exempt_schemas:
-                continue
-            if schema not in allowed:
-                raise SchemaNotAllowedError(schema)
+            parts = chain.split(".")
+            if len(parts) >= 3:
+                db, schema = parts[0], parts[1]
+                if db in exempt_dbs or schema in exempt_schemas:
+                    continue
+                if schema not in allowed:
+                    raise SchemaNotAllowedError(schema)
+            elif len(parts) == 2:
+                schema = parts[0]
+                if schema in exempt_dbs or schema in exempt_schemas:
+                    continue
+                if schema not in allowed:
+                    raise SchemaNotAllowedError(schema)
 
 
 # Module-level singleton

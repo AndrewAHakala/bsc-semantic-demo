@@ -55,7 +55,7 @@ _INSERT_TRACE_SQL = """
         candidate_count, chosen_order_ids,
         sql_candidate_ms, cortex_rerank_ms, sql_fetch_top_ms, total_ms,
         error
-    ) VALUES (
+    ) SELECT
         %(trace_id)s, %(created_at)s, %(mode)s, %(normalized_request_summary)s,
         %(parse_prompt_version)s, %(rerank_prompt_version)s,
         %(candidate_sql_hash)s, %(fetch_sql_hash)s,
@@ -63,7 +63,6 @@ _INSERT_TRACE_SQL = """
         %(candidate_count)s, %(chosen_order_ids)s,
         %(sql_candidate_ms)s, %(cortex_rerank_ms)s, %(sql_fetch_top_ms)s, %(total_ms)s,
         %(error)s
-    )
 """
 
 
@@ -176,10 +175,11 @@ class SemanticService:
                     elapsed_ms=0.0,
                 )
             else:
+                rerank_pool = candidates[:20]
                 with timer.segment("cortex_rerank"):
                     rerank_result = self._cortex.rerank_candidates(
                         query=query_str,
-                        candidates=candidates,
+                        candidates=rerank_pool,
                         top_n=request.top_n,
                     )
 
@@ -398,11 +398,15 @@ class SemanticService:
             if request.fields.facility_name:
                 summary += f" facility={request.fields.facility_name[:20]}"
 
+            array_literal = (
+                "ARRAY_CONSTRUCT(" + ", ".join(f"'{oid}'" for oid in chosen_ids) + ")"
+                if chosen_ids
+                else "PARSE_JSON('[]')"
+            )
             conn = self._sf._get_conn()
             cur = conn.cursor()
             cur.execute(
-                _INSERT_TRACE_SQL.replace("%(chosen_order_ids)s", "ARRAY_CONSTRUCT("
-                    + ", ".join(f"'{oid}'" for oid in chosen_ids) + ")"),
+                _INSERT_TRACE_SQL.replace("%(chosen_order_ids)s", array_literal),
                 {
                     "trace_id": trace_id,
                     "created_at": datetime.now(timezone.utc),

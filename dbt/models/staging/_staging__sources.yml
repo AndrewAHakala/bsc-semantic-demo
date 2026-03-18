@@ -3,8 +3,8 @@ version: 2
 sources:
   - name: demo_bsc_raw
     description: Raw synthetic BSC medical device fulfillment data loaded by generate_and_load.py
-    database: "{{ var('database') }}"
-    schema: "{{ var('schema') }}"
+    database: global_supply_chain
+    schema: DEMO_BSC
 
     tables:
       - name: CUSTOMER_DIM

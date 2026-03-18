@@ -15,9 +15,6 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-vars:
-  database: "{{ env_var('SNOWFLAKE_DATABASE', 'global_supply_chain') }}"
-  schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'DEMO_BSC') }}"
 
 models:
   bsc_order_status:

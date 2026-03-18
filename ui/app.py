@@ -41,11 +41,24 @@ st.markdown(
     "Powered by Snowflake + Cortex_"
 )
 
-# Health check badge
+# Health check badges
 try:
-    hc = httpx.get(f"{API_BASE}/health", timeout=3.0)
-    sf_ok = hc.json().get("snowflake", False)
-    st.success("✅ Connected to Snowflake") if sf_ok else st.warning("⚠️ Snowflake degraded")
+    hc = httpx.get(f"{API_BASE}/health", timeout=10.0)
+    hc_data = hc.json()
+
+    col_sf, col_dbt = st.columns(2)
+    with col_sf:
+        if hc_data.get("snowflake", False):
+            st.success("✅ Connected to Snowflake")
+        else:
+            st.warning("⚠️ Snowflake degraded")
+    with col_dbt:
+        if hc_data.get("dbt_cloud", False):
+            st.success("✅ Connected to dbt Cloud")
+        elif hc_data.get("dbt_cloud_configured", False):
+            st.warning("⚠️ dbt Cloud configured but unreachable")
+        else:
+            st.info("ℹ️ dbt Cloud not configured")
 except Exception:
     st.error("❌ API unreachable — is the FastAPI server running?")
 
