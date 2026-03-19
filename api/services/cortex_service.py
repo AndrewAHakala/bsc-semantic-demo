@@ -411,16 +411,22 @@ class CortexService:
                     data = repaired
                 else:
                     raise
+            def _clean(val):
+                """Treat string 'null'/'None' as actual None."""
+                if isinstance(val, str) and val.strip().lower() in ("null", "none", ""):
+                    return None
+                return val
+
             return ParsedIntent(
                 intent=data.get("intent", "order_lookup"),
-                order_id=data.get("order_id"),
-                purchase_order_id=data.get("purchase_order_id"),
-                customer_name=data.get("customer_name"),
-                facility_name=data.get("facility_name"),
-                date_start=data.get("date_start"),
-                date_end=data.get("date_end"),
-                contact_name=data.get("contact_name"),
-                metric_question=data.get("metric_question"),
+                order_id=_clean(data.get("order_id")),
+                purchase_order_id=_clean(data.get("purchase_order_id")),
+                customer_name=_clean(data.get("customer_name")),
+                facility_name=_clean(data.get("facility_name")),
+                date_start=_clean(data.get("date_start")),
+                date_end=_clean(data.get("date_end")),
+                contact_name=_clean(data.get("contact_name")),
+                metric_question=_clean(data.get("metric_question")),
                 metric_params=data.get("metric_params"),
             )
         except Exception as exc:
